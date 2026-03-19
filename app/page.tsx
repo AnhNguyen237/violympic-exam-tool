@@ -54,6 +54,34 @@ const toDisplayCell = (value: CellValue): string => String(value ?? "").trim();
 
 const normalizePgsCode = (value: string): string => normalizeText(value);
 
+const parseSessionLabel = (sectionTitle: string): string => {
+  // From: "NGÀY 1 - CA 1 (08:00 - 08:30) - 20/03"
+  // To:   "Ca 1 (08:00 - 08:30)"
+  const match = sectionTitle.match(/CA\s*(\d+)\s*\((\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\)/i);
+  if (!match) return sectionTitle;
+  const [, session, start, end] = match;
+  return `Ca ${session} (${start} - ${end})`;
+};
+
+const buildViolationSheetName = (sectionTitle: string): string => {
+  // Make sheet name unique across days while staying short (<=31 chars).
+  // Prefer: "N1-C1 08:00-08:30 20/03"
+  const match = sectionTitle.match(
+    /NGÀY\s*(\d+)\s*-\s*CA\s*(\d+)\s*\((\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\)\s*-\s*(\d{2})\/(\d{2})/i
+  );
+  if (!match) {
+    const fallback = sectionTitle.trim().replace(/[\\/?*[\]:]/g, " ").replace(/\s+/g, " ");
+    return fallback.length > 31 ? fallback.slice(0, 31) : fallback;
+  }
+
+  const [, day, session, start, end, dd, mm] = match;
+  // ":" is not allowed in Excel sheet names -> swap to "."
+  const safeStart = start.replaceAll(":", ".");
+  const safeEnd = end.replaceAll(":", ".");
+  const base = `Ngày${day} - Ca${session}`;
+  return base.length > 31 ? base.slice(0, 31) : base;
+};
+
 const buildReportByPgs = (buffer: ArrayBuffer, pgsCode: string): ReportData => {
   const workbook = XLSX.read(buffer, { type: "array" });
   const pgsSheet = workbook.Sheets["Phân bổ chi tiết"];
@@ -200,6 +228,146 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const exportViolationTemplate = () => {
+    if (!report) return;
+
+    const headers = [
+      "Ca thi",
+      "Hội đồng",
+      "Phòng thi",
+      "Số lượng HS đăng ký",
+      "Số lượng HS thực tế",
+      "Hành vi vi phạm",
+      "Time vi phạm (theo record)",
+      "Hủy",
+    ];
+
+    const borderAll = {
+      top: { style: "thin", color: { rgb: "000000" } },
+      bottom: { style: "thin", color: { rgb: "000000" } },
+      left: { style: "thin", color: { rgb: "000000" } },
+      right: { style: "thin", color: { rgb: "000000" } },
+    } as const;
+
+    const styleHeader = {
+      font: { bold: true, sz: 11, color: { rgb: "FF0000" } },
+      fill: { fgColor: { rgb: "FFFF00" } },
+      alignment: { vertical: "center", horizontal: "center", wrapText: true },
+      border: borderAll,
+    } as const;
+
+    const styleCell = {
+      font: { sz: 11, color: { rgb: "111827" } },
+      alignment: { vertical: "top", horizontal: "left", wrapText: true },
+      border: borderAll,
+    } as const;
+
+    const styleSessionCell = {
+      font: { sz: 11, color: { rgb: "111827" } },
+      alignment: { vertical: "center", horizontal: "left", wrapText: true },
+      border: borderAll,
+    } as const;
+
+    const colWidths = [
+      { wch: 22 }, // Ca thi
+      { wch: 52 }, // Hoi dong
+      { wch: 10 }, // Phong thi
+      { wch: 18 }, // SL dang ky
+      { wch: 18 }, // SL thuc te
+      { wch: 40 }, // Hanh vi
+      { wch: 26 }, // Time vi pham
+      { wch: 10 }, // Huy
+    ];
+
+    const wb = XLSXStyle.utils.book_new();
+    const usedSheetNames = new Map<string, number>();
+
+    for (const section of report.sections) {
+      const rows: string[][] = [];
+      rows.push(headers);
+
+      // Best-effort mapping from the “phân công” export:
+      // [0]=STT, [1]=Tên HĐT, [2]=Mã HĐT, [3]=Phòng thi, [4]=SL đăng ký, ...
+      const data = section.rows.map((r) => ({
+        council: String(r[1] ?? "").trim(),
+        room: String(r[3] ?? "").trim(),
+        registered: String(r[4] ?? "").trim(),
+      }));
+
+      for (const item of data) {
+        rows.push([
+          "", // merged session label
+          item.council,
+          item.room,
+          item.registered,
+          "", // actual
+          "", // violation
+          "", // time
+          "", // cancel
+        ]);
+      }
+
+      const ws = XLSXStyle.utils.aoa_to_sheet(rows) as XLSXStyle.WorkSheet & {
+        "!cols"?: { wch?: number }[];
+        "!merges"?: { s: { r: number; c: number }; e: { r: number; c: number } }[];
+        "!freeze"?: { xSplit?: number; ySplit?: number };
+      };
+
+      ws["!cols"] = colWidths;
+      ws["!freeze"] = { ySplit: 1 };
+
+      // Merge "Ca thi" column vertically like the template image (if there is data)
+      const sessionLabel = parseSessionLabel(section.title);
+      if (rows.length > 1) {
+        ws["!merges"] = [
+          {
+            s: { r: 1, c: 0 },
+            e: { r: rows.length - 1, c: 0 },
+          },
+        ];
+        const addr = XLSXStyle.utils.encode_cell({ r: 1, c: 0 });
+        ws[addr] = { t: "s", v: sessionLabel, s: styleSessionCell } as unknown as XLSXStyle.CellObject;
+      }
+
+      const range = XLSXStyle.utils.decode_range(ws["!ref"] ?? "A1:H1");
+      for (let r = range.s.r; r <= range.e.r; r++) {
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const addr = XLSXStyle.utils.encode_cell({ r, c });
+          const cell = ws[addr];
+          if (!cell) continue;
+
+          if (r === 0) {
+            cell.s = styleHeader;
+          } else if (c === 0 && r === 1 && rows.length > 1) {
+            // already styled via ws[addr] assignment above
+            cell.s = styleSessionCell;
+          } else {
+            cell.s = styleCell;
+          }
+        }
+      }
+
+      // Sheet name: Excel limit is 31 chars & must be unique
+      const rawBase = buildViolationSheetName(section.title) || section.sheetName.slice(0, 31);
+      const baseName = rawBase
+        .trim()
+        .replace(/[\\/?*[\]:]/g, " ")
+        .replace(/\s+/g, " ")
+        .slice(0, 31);
+      const count = (usedSheetNames.get(baseName) ?? 0) + 1;
+      usedSheetNames.set(baseName, count);
+      const suffix = count === 1 ? "" : ` (${count})`;
+      const uniqueName =
+        suffix.length === 0
+          ? baseName
+          : `${baseName.slice(0, Math.max(0, 31 - suffix.length))}${suffix}`;
+
+      XLSXStyle.utils.book_append_sheet(wb, ws, uniqueName);
+    }
+
+    XLSXStyle.writeFile(wb, `vi-pham-${report.pgsCode || "pgs"}.xlsx`);
+  };
+
   const exportReport = () => {
     if (!report) return;
 
@@ -254,13 +422,16 @@ export default function Home() {
     };
 
     // Column widths (rough but works well visually)
+    // NOTE: Don't let long merged title/meta lines (col A) inflate widths.
     const colWidths = Array.from({ length: maxCols }, (_, c) => {
       const sample = sheetRows
-        .slice(0, 120)
+        .slice(0, 300)
+        .filter((_, rIdx) => rowKinds[rIdx] === "header" || rowKinds[rIdx] === "data")
         .map((r) => String(r[c] ?? ""))
         .reduce((m, v) => Math.max(m, v.length), 0);
-      const base =
-        c === 0 ? 10 : c === 1 ? 46 : c === 2 ? 14 : c === 3 ? 8 : c === 4 ? 14 : 18;
+
+      // Make "STT HĐT" (first column) smaller on export.
+      const base = c === 0 ? 6 : c === 1 ? 46 : c === 2 ? 14 : c === 3 ? 8 : c === 4 ? 14 : 18;
       return Math.min(70, Math.max(base, Math.ceil(sample * 0.9)));
     });
     ws["!cols"] = colWidths.map((wch) => ({ wch }));
@@ -302,7 +473,7 @@ export default function Home() {
       border: borderAll,
     } as const;
     const styleCell = {
-      font: { sz: 10, color: { rgb: "111827" } },
+      font: { sz: 11, color: { rgb: "111827" } },
       alignment: { vertical: "top", horizontal: "left", wrapText: true },
       border: borderAll,
     } as const;
@@ -476,7 +647,7 @@ export default function Home() {
             disabled={!canSearch || loading}
             className="w-fit rounded-md bg-black px-4 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {loading ? "Dang xu ly..." : "Tao ket qua"}
+            {loading ? "Đang xử lý..." : "Tạo kết quả"}
           </button>
           <button
             type="button"
@@ -485,6 +656,14 @@ export default function Home() {
             className="w-fit rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Export XLSX
+          </button>
+          <button
+            type="button"
+            onClick={exportViolationTemplate}
+            disabled={!report || loading}
+            className="w-fit rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Export file vi phạm
           </button>
         </div>
       </section>
