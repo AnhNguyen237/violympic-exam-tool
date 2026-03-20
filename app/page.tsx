@@ -110,7 +110,9 @@ const parseListFree = (buffer: ArrayBuffer): ListFreeData => {
   const targetPgsHeaderNorm = normalizePgsCode("Mã phòng giám sát");
   const pgsHeaderKey =
     headers.find((h) => normalizePgsCode(h) === targetPgsHeaderNorm) ??
-    headers.find((h) => normalizePgsCode(h).includes(targetPgsHeaderNorm));
+    headers.find((h) => normalizePgsCode(h).includes(targetPgsHeaderNorm)) ??
+    // Fallback: some lists use a simple "PGS" column name.
+    headers.find((h) => normalizePgsCode(h).includes(normalizePgsCode("pgs")));
 
   if (!pgsHeaderKey) {
     throw new Error("Khong tim thay cot 'Mã phòng giám sát' trong list-free.xlsx.");
@@ -350,6 +352,9 @@ export default function Home() {
   const [listFree, setListFree] = useState<ListFreeData | null>(null);
   const [listFreeLoading, setListFreeLoading] = useState(false);
   const [listFreeError, setListFreeError] = useState("");
+  const [listUnknowExpanded, setListUnknowExpanded] = useState<ListFreeData | null>(null);
+  const [listUnknowExpandedLoading, setListUnknowExpandedLoading] = useState(false);
+  const [listUnknowExpandedError, setListUnknowExpandedError] = useState("");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [subjectByDaySession, setSubjectByDaySession] = useState<Record<string, string>>({});
   const [chatLogText, setChatLogText] = useState<string>("");
@@ -372,6 +377,14 @@ export default function Home() {
     const input = normalizePgsCode(pgsCode);
     return listFree.rows.filter((row) => normalizePgsCode(String(row[listFree.pgsHeaderKey] ?? "")) === input);
   }, [listFree, pgsCode]);
+
+  const listUnknowExpandedMatchingRows = useMemo(() => {
+    if (!listUnknowExpanded || !pgsCode.trim()) return [];
+    const input = normalizePgsCode(pgsCode);
+    return listUnknowExpanded.rows.filter(
+      (row) => normalizePgsCode(String(row[listUnknowExpanded.pgsHeaderKey] ?? "")) === input
+    );
+  }, [listUnknowExpanded, pgsCode]);
 
   const copyToClipboard = async (text: string) => {
     const value = String(text ?? "").trim();
@@ -414,7 +427,6 @@ export default function Home() {
   useEffect(() => {
     // Default data source: public/data.xlsx
     void loadDefaultExcel();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -451,8 +463,36 @@ export default function Home() {
     void loadListFree();
   }, []);
 
+  useEffect(() => {
+    const loadListUnknowExpanded = async () => {
+      try {
+        setListUnknowExpandedLoading(true);
+        setListUnknowExpandedError("");
+        const res = await fetch("/list-unknow-expanded.xlsx", { cache: "no-store" });
+        if (!res.ok) throw new Error("Khong the tai file mac dinh tu public/list-unknow-expanded.xlsx.");
+        const buffer = await res.arrayBuffer();
+        setListUnknowExpanded(parseListFree(buffer));
+      } catch (e) {
+        if (e instanceof Error && e.message) setListUnknowExpandedError(e.message);
+        else setListUnknowExpandedError("Co loi khi doc list-unknow-expanded.xlsx.");
+      } finally {
+        setListUnknowExpandedLoading(false);
+      }
+    };
+
+    void loadListUnknowExpanded();
+  }, []);
+
   const exportViolationTemplate = () => {
     if (!report) return;
+    if (!listFree) {
+      setError("Chưa tải xong list-free.xlsx. Vui lòng chờ và thử lại.");
+      return;
+    }
+    if (!listUnknowExpanded) {
+      setError("Chưa tải xong list-unknow-expanded.xlsx. Vui lòng chờ và thử lại.");
+      return;
+    }
 
     const parseNumberCell = (value: unknown): number | "" => {
       const s = String(value ?? "").trim();
@@ -467,8 +507,10 @@ export default function Home() {
     const headers = [
       "Ca thi",
       "Hội đồng",
+      "Mã hội đồng",
       "Phòng thi",
       "Số lượng HS đăng ký",
+      "Số lượng HS tự do",
       "Số lượng HS thực tế",
       "Hành vi vi phạm",
       "Time vi phạm (theo record)",
@@ -501,11 +543,23 @@ export default function Home() {
       border: borderAll,
     } as const;
 
+    const styleFreeCell = {
+      ...styleCell,
+      fill: { fgColor: { rgb: "FCA5A5" } }, // highlight "Số lượng HS tự do"
+    } as const;
+
+    const styleSessionCellFree = {
+      ...styleSessionCell,
+      fill: { fgColor: { rgb: "FCA5A5" } },
+    } as const;
+
     const colWidths = [
       { wch: 48 }, // Ca thi + môn (xuống dòng)
       { wch: 52 }, // Hoi dong
+      { wch: 14 }, // Ma Hoi dong
       { wch: 10 }, // Phong thi
       { wch: 18 }, // SL dang ky
+      { wch: 18 }, // SL tu do
       { wch: 18 }, // SL thuc te
       { wch: 40 }, // Hanh vi
       { wch: 26 }, // Time vi pham
@@ -529,10 +583,121 @@ export default function Home() {
 
     const orderedDays = Array.from(sectionDays).sort((a, b) => a - b);
 
+    const buildStudentFullInfoText = (s: RowData, headersSource: string[]): string => {
+      // Không lược bỏ cột: nối đầy đủ "Header: value" theo đúng headers của từng file.
+      return headersSource
+        .map((h) => {
+          const v = String(s[h] ?? "").trim();
+          return `${h}: ${v}`;
+        })
+        .join("\n");
+    };
+
+    const parseCaThiFromListFree = (
+      value: unknown
+    ): { day: number; session: number } | null => {
+      const t = String(value ?? "")
+        .replace(/\r?\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!t) return null;
+
+      const dayMatch =
+        t.match(/Ngày\s*thi\s*0*(\d+)/i) || t.match(/Ngay\s*thi\s*0*(\d+)/i);
+      const sessionMatch =
+        t.match(/Ca\s*thi\s*(?:dự\s*phòng\s*)?0*(\d+)/i) ||
+        t.match(/Ca\s*thi\s*(?:du\s*phong\s*)?0*(\d+)/i);
+
+      if (!dayMatch || !sessionMatch) return null;
+      const day = Number(dayMatch[1]);
+      const session = Number(sessionMatch[1]);
+      if (!Number.isFinite(day) || !Number.isFinite(session)) return null;
+      return { day, session };
+    };
+
+    const studentsByDaySession = new Map<string, RowData[]>();
+    for (const row of listFreeMatchingRows) {
+      const parsed = parseCaThiFromListFree(row["Ca thi"]);
+      if (!parsed) continue;
+      const key = `${parsed.day}-${parsed.session}`;
+      const arr = studentsByDaySession.get(key);
+      if (arr) arr.push(row);
+      else studentsByDaySession.set(key, [row]);
+    }
+
+    const parseDayFromUnknownList = (value: unknown): number | null => {
+      const t = String(value ?? "")
+        .replace(/\r?\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!t) return null;
+      const m = t.match(/Ngày\s*thi\s*0*(\d+)/i);
+      if (!m) return null;
+      const day = Number(m[1]);
+      return Number.isFinite(day) ? day : null;
+    };
+
+    const parseBuoiFromUnknownTime = (value: unknown): "sang" | "chieu" | null => {
+      const t = String(value ?? "")
+        .replace(/\u2013|\u2014/g, "-") // normalize en/em dash
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!t) return null;
+
+      // Example: "09h00 – 09h30"
+      const m = t.match(/(\d{1,2})\s*h/i);
+      if (!m) return null;
+      const hour = Number(m[1]);
+      if (!Number.isFinite(hour)) return null;
+      return hour < 12 ? "sang" : "chieu";
+    };
+
+    const mapUnknownDayBuoiToExportCa = (day: number, buoi: "sang" | "chieu"): number | null => {
+      // Requirement mapping:
+      // - Ngày 1 buổi sáng -> Ca 4
+      // - Ngày 1 buổi chiều -> Ca 8
+      // - Ngày 2 buổi sáng -> Ca 4
+      // - Ngày 2 buổi chiều -> Ca 6
+      if (buoi === "sang") return day === 1 || day === 2 ? 4 : null;
+      return day === 1 ? 8 : day === 2 ? 6 : null;
+    };
+
+    const studentsByDaySessionUnknown = new Map<string, RowData[]>();
+    for (const row of listUnknowExpandedMatchingRows) {
+      const day = parseDayFromUnknownList(row["Ngày thi"]);
+      const buoi = parseBuoiFromUnknownTime(row["Thời gian thi"]);
+      if (!day || !buoi) continue;
+      const exportSession = mapUnknownDayBuoiToExportCa(day, buoi);
+      if (!exportSession) continue;
+      const key = `${day}-${exportSession}`;
+      const arr = studentsByDaySessionUnknown.get(key);
+      if (arr) arr.push(row);
+      else studentsByDaySessionUnknown.set(key, [row]);
+    }
+
+    // If list-free contains days not present in "report.sections", still generate those days.
+    const listFreeDays = new Set<number>();
+    for (const key of studentsByDaySession.keys()) {
+      const [dayStr] = key.split("-");
+      const dayNum = Number(dayStr);
+      if (Number.isFinite(dayNum)) listFreeDays.add(dayNum);
+    }
+
+    const listUnknownDays = new Set<number>();
+    for (const key of studentsByDaySessionUnknown.keys()) {
+      const [dayStr] = key.split("-");
+      const dayNum = Number(dayStr);
+      if (Number.isFinite(dayNum)) listUnknownDays.add(dayNum);
+    }
+
+    const orderedDaysWithListFree = Array.from(new Set([...orderedDays, ...listFreeDays, ...listUnknownDays])).sort(
+      (a, b) => a - b
+    );
+
     const wb = XLSXStyle.utils.book_new();
     const usedSheetNames = new Map<string, number>();
 
-    for (const day of orderedDays) {
+    for (const day of orderedDaysWithListFree) {
       for (const slot of VIOLATION_SESSION_SLOTS) {
         const section = sectionsByDaySession.get(`${day}-${slot.session}`);
         const sessionLabel = `Ca ${slot.session} (${slot.label})`;
@@ -543,51 +708,227 @@ export default function Home() {
             ""
         ).trim();
         const sessionCellText = subjectName ? `${sessionLabel}\n${subjectName}` : sessionLabel;
+
+        const studentRows = studentsByDaySession.get(`${day}-${slot.session}`) ?? [];
+
+        // Count "Số lượng HS tự do" (free students) per council code within this day+session.
+        // Rule: "Có trong phòng thi" == "Không" => free.
+        const freeCountByCouncilCode = new Map<string, number>();
+        const councilNameByCouncilCode = new Map<string, string>();
+        for (const s of studentRows) {
+          const councilCode = String(s["Mã hội đồng"] ?? "").trim();
+          if (!councilCode) continue;
+
+          const councilName = String(s["Tên hội đồng"] ?? "").trim();
+          if (councilName && !councilNameByCouncilCode.has(councilCode)) {
+            councilNameByCouncilCode.set(councilCode, councilName);
+          }
+
+          const coTrongPhongThiNorm = normalizeText(String(s["Có trong phòng thi"] ?? ""));
+          if (coTrongPhongThiNorm === normalizeText("Không")) {
+            freeCountByCouncilCode.set(
+              councilCode,
+              (freeCountByCouncilCode.get(councilCode) ?? 0) + 1
+            );
+          }
+        }
+
+        // Only highlight main table rows (not the student detail block).
+        const highlightedRowIndexes = new Set<number>();
+
         const rows: (string | number)[][] = [];
         const firstHeader = slot.reserve ? "Ca thi dự phòng" : "Ca thi";
         rows.push([firstHeader, ...headers.slice(1)]);
 
         const defaultRowCount = 6;
+        const freeCouncils = Array.from(freeCountByCouncilCode.entries())
+          .map(([councilCode, freeCount]) => ({
+            councilCode,
+            councilName: councilNameByCouncilCode.get(councilCode) ?? "",
+            freeCount,
+          }))
+          .filter((x) => x.freeCount > 0);
+
         if (!section) {
-          rows.push([sessionCellText, "", "", "", "", "", "", ""]);
-          for (let i = 1; i < defaultRowCount; i++) {
-            rows.push(["", "", "", "", "", "", "", ""]);
+          if (freeCouncils.length > 0) {
+            for (let i = 0; i < freeCouncils.length; i++) {
+              const item = freeCouncils[i];
+              const rowIndex = rows.length;
+              rows.push([
+                i === 0 ? sessionCellText : "",
+                item.councilName, // Hội đồng
+                item.councilCode, // Mã hội đồng
+                "1", // Phòng thi
+                0, // Số lượng HS đăng ký
+                item.freeCount, // Số lượng HS tự do
+                "", // Số lượng HS thực tế
+                "", // Hành vi vi phạm
+                "", // Time vi phạm (theo record)
+                "", // Hủy
+              ]);
+              highlightedRowIndexes.add(rowIndex);
+            }
+          } else {
+            rows.push([sessionCellText, "", "", "", "", "", "", "", "", ""]);
           }
         } else {
           // Best-effort mapping from the “phân công” export:
           // [0]=STT, [1]=Tên HĐT, [2]=Mã HĐT, [3]=Phòng thi, [4]=SL đăng ký, [5]=SL thực tế, ...
           const data = section.rows.map((r) => ({
             council: String(r[1] ?? "").trim(),
+            councilCode: String(r[2] ?? "").trim(),
             room: String(r[3] ?? "").trim(),
             registered: parseNumberCell(r[4]),
             actual: parseNumberCell(r[5]),
           }));
 
-          if (data.length === 0) {
-            rows.push([sessionCellText, "", "", "", "", "", "", ""]);
+          const existingCouncilCodeSet = new Set<string>(data.map((d) => d.councilCode).filter(Boolean));
+
+          if (data.length === 0 && freeCouncils.length > 0) {
+            for (let i = 0; i < freeCouncils.length; i++) {
+              const item = freeCouncils[i];
+              const rowIndex = rows.length;
+              rows.push([
+                i === 0 ? sessionCellText : "",
+                item.councilName,
+                item.councilCode,
+                "1",
+                0,
+                item.freeCount,
+                "",
+                "",
+                "",
+                "",
+              ]);
+              highlightedRowIndexes.add(rowIndex);
+            }
+          } else if (data.length === 0) {
+            // Section exists but has no rows; still keep the session label row for consistency.
+            rows.push([sessionCellText, "", "", "", "", "", "", "", "", ""]);
           } else {
             for (let i = 0; i < data.length; i++) {
               const item = data[i];
+              const rowIndex = rows.length;
+              const freeCount = freeCountByCouncilCode.get(item.councilCode) ?? 0;
+              const freeCellValue: number | "" = freeCount > 0 ? freeCount : "";
+
+              if (freeCount > 0) highlightedRowIndexes.add(rowIndex);
+
               rows.push([
                 i === 0 ? sessionCellText : "",
                 item.council,
+                item.councilCode,
                 item.room,
                 item.registered,
+                freeCellValue,
                 item.actual,
-                "", // violation
-                "", // time
-                "", // cancel
+                "", // Hành vi vi phạm
+                "", // Time vi phạm (theo record)
+                "", // Hủy
               ]);
             }
           }
 
-          while (rows.length - 1 < defaultRowCount) {
-            rows.push(["", "", "", "", "", "", "", ""]);
+          // Add councils that exist in list-free but not in this ca thi sheet.
+          for (const item of freeCouncils) {
+            if (!item.councilCode) continue;
+            if (existingCouncilCodeSet.has(item.councilCode)) continue;
+
+            const rowIndex = rows.length;
+            rows.push([
+              "",
+              item.councilName,
+              item.councilCode,
+              "1", // Phòng thi
+              0, // Số lượng HS đăng ký
+              item.freeCount, // Số lượng HS tự do
+              "", // Số lượng HS thực tế
+              "",
+              "",
+              "",
+            ]);
+            highlightedRowIndexes.add(rowIndex);
           }
         }
 
-        const councilCodesLine = getSectionCouncilCodes(section?.rows ?? []) || "";
-        rows.push([councilCodesLine, "", "", "", "", "", "", ""]);
+        while (rows.length - 1 < defaultRowCount) {
+          rows.push(["", "", "", "", "", "", "", "", "", ""]);
+        }
+
+        // Footer row: list all council codes that appear in this sheet (existing + newly added from list-free).
+        const councilCodesSet = new Set<string>();
+        const councilCodesList: string[] = [];
+        for (const r of section?.rows ?? []) {
+          const code = String(r?.[2] ?? "").trim();
+          if (!code || councilCodesSet.has(code)) continue;
+          councilCodesSet.add(code);
+          councilCodesList.push(code);
+        }
+        for (const code of freeCountByCouncilCode.keys()) {
+          if (councilCodesSet.has(code)) continue;
+          councilCodesSet.add(code);
+          councilCodesList.push(code);
+        }
+        const councilCodesLine = councilCodesList.join(", ");
+        rows.push([councilCodesLine, "", "", "", "", "", "", "", "", ""]);
+
+        const mainFooterRowIndex = rows.length - 1;
+        const studentRowsUnknown = studentsByDaySessionUnknown.get(`${day}-${slot.session}`) ?? [];
+        if (studentRows.length > 0 || studentRowsUnknown.length > 0) {
+          const blankRow: string[] = ["", "", "", "", "", "", "", "", "", ""];
+          // Keep exactly 3 empty rows between main table and student block.
+          for (let i = 0; i < 3; i++) rows.push([...blankRow]);
+
+          let isFirstRow = true;
+          // 1) Students from list-free (original mapping)
+          for (let i = 0; i < studentRows.length; i++) {
+            const s = studentRows[i];
+            const fullInfoText = buildStudentFullInfoText(s, listFree.headers);
+            const caThi = String(s["Ca thi"] ?? "").trim();
+            const coTrongPhongThi = String(s["Có trong phòng thi"] ?? "").trim();
+            rows.push([
+              isFirstRow ? "Danh sach HS" : "",
+              String(s["Tên hội đồng"] ?? "").trim(), // Hội đồng
+              String(s["Mã hội đồng"] ?? "").trim(), // Mã hội đồng
+              "", // Phòng thi
+              "", // Số lượng HS đăng ký
+              "", // Số lượng HS tự do
+              "", // Số lượng HS thực tế
+              fullInfoText, // Hành vi vi phạm column but contains all list-free fields
+              caThi,
+              coTrongPhongThi,
+            ]);
+            isFirstRow = false;
+          }
+
+          // 2) Students from list-unknow-expanded (buổi sáng/chiều mapping)
+          const unknownHeaders = (listUnknowExpanded?.headers ?? []).filter((h) => {
+            const nh = normalizeText(h);
+            return nh !== normalizeText("Ca thi") && nh !== normalizeText("Thời gian thi");
+          });
+          for (let i = 0; i < studentRowsUnknown.length; i++) {
+            const s = studentRowsUnknown[i];
+            const fullInfoText = buildStudentFullInfoText(s, unknownHeaders);
+            const ngayThi = String(s["Ngày thi"] ?? "").trim();
+            const thoiGianThi = String(s["Thời gian thi"] ?? "").trim();
+            void thoiGianThi; // kept for mapping logic only (not pasted)
+            // Requirement: do not paste "ca thi" and "thời gian thi" from this file into export.
+            const timeText = [ngayThi].filter(Boolean).join(" - ");
+            rows.push([
+              isFirstRow ? "Danh sach HS" : "",
+              "", // Hội đồng (không có trong list-unknow-expanded)
+              "", // Mã hội đồng (không có trong list-unknow-expanded)
+              "", // Phòng thi
+              "", // Số lượng HS đăng ký
+              "", // Số lượng HS tự do
+              "", // Số lượng HS thực tế
+              fullInfoText,
+              timeText, // only ngày thi (if needed for record)
+              "", // Ca thi (removed)
+            ]);
+            isFirstRow = false;
+          }
+        }
 
         const ws = XLSXStyle.utils.aoa_to_sheet(rows) as XLSXStyle.WorkSheet & {
           "!cols"?: { wch?: number }[];
@@ -599,31 +940,32 @@ export default function Home() {
         ws["!freeze"] = { ySplit: 1 };
 
         // Merge "Ca thi" column for data rows only (footer row lists mã HĐT separately)
-        const footerRowIndex = rows.length - 1;
+        const footerRowIndex = mainFooterRowIndex;
         const lastDataRowIndex = footerRowIndex - 1;
         if (lastDataRowIndex >= 1) {
           ws["!merges"] = [
             { s: { r: 1, c: 0 }, e: { r: lastDataRowIndex, c: 0 } },
-            { s: { r: footerRowIndex, c: 0 }, e: { r: footerRowIndex, c: 7 } },
+            { s: { r: footerRowIndex, c: 0 }, e: { r: footerRowIndex, c: 9 } },
           ];
           const addr = XLSXStyle.utils.encode_cell({ r: 1, c: 0 });
           ws[addr] = { t: "s", v: sessionCellText, s: styleSessionCell } as unknown as XLSXStyle.CellObject;
         }
 
-        const range = XLSXStyle.utils.decode_range(ws["!ref"] ?? "A1:H1");
+        const range = XLSXStyle.utils.decode_range(ws["!ref"] ?? "A1:J1");
         for (let r = range.s.r; r <= range.e.r; r++) {
           for (let c = range.s.c; c <= range.e.c; c++) {
             const addr = XLSXStyle.utils.encode_cell({ r, c });
             const cell = ws[addr];
             if (!cell) continue;
 
+            const isHighlighted = highlightedRowIndexes.has(r);
             if (r === 0) {
               cell.s = styleHeader;
             } else if (c === 0 && r === 1 && rows.length > 1) {
               // already styled via ws[addr] assignment above
-              cell.s = styleSessionCell;
+              cell.s = isHighlighted ? styleSessionCellFree : styleSessionCell;
             } else {
-              cell.s = styleCell;
+              cell.s = isHighlighted ? styleFreeCell : styleCell;
             }
           }
         }
