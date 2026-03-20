@@ -27,6 +27,13 @@ type ReportData = {
   sections: ReportSection[];
 };
 
+type ListFreeData = {
+  sheetName: string;
+  headers: string[];
+  rows: RowData[];
+  pgsHeaderKey: string;
+};
+
 type SessionSlot = {
   session: number;
   label: string;
@@ -71,6 +78,46 @@ const cleanHeader = (header: string): string => {
 const toDisplayCell = (value: CellValue): string => String(value ?? "").trim();
 
 const normalizePgsCode = (value: string): string => normalizeText(value);
+
+const parseListFree = (buffer: ArrayBuffer): ListFreeData => {
+  const workbook = XLSX.read(buffer, { type: "array" });
+  const sheetName = workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  if (!ws || !sheetName) {
+    throw new Error("Khong the doc sheet tu list-free.xlsx.");
+  }
+
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false }) as unknown as CellValue[][];
+  const headerRow = aoa[0] ?? [];
+
+  // Ensure we always have stable header keys.
+  const headers: string[] = headerRow.map((h, idx) => {
+    const s = String(h ?? "").trim();
+    return s || `COL_${idx + 1}`;
+  });
+
+  const dataRows = aoa.slice(1);
+  const rows: RowData[] = dataRows
+    .map((row) => {
+      const obj: RowData = {};
+      headers.forEach((header, idx) => {
+        obj[header] = toDisplayCell(row?.[idx]);
+      });
+      return obj;
+    })
+    .filter((obj) => Object.values(obj).some((v) => String(v ?? "").trim() !== ""));
+
+  const targetPgsHeaderNorm = normalizePgsCode("Mã phòng giám sát");
+  const pgsHeaderKey =
+    headers.find((h) => normalizePgsCode(h) === targetPgsHeaderNorm) ??
+    headers.find((h) => normalizePgsCode(h).includes(targetPgsHeaderNorm));
+
+  if (!pgsHeaderKey) {
+    throw new Error("Khong tim thay cot 'Mã phòng giám sát' trong list-free.xlsx.");
+  }
+
+  return { sheetName, headers, rows, pgsHeaderKey };
+};
 
 const getSectionCouncilCodes = (rows: string[][]): string => {
   // [0]=STT, [1]=Tên HĐT, [2]=Mã HĐT, ...
@@ -300,6 +347,9 @@ export default function Home() {
   const [report, setReport] = useState<ReportData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [listFree, setListFree] = useState<ListFreeData | null>(null);
+  const [listFreeLoading, setListFreeLoading] = useState(false);
+  const [listFreeError, setListFreeError] = useState("");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [subjectByDaySession, setSubjectByDaySession] = useState<Record<string, string>>({});
   const [chatLogText, setChatLogText] = useState<string>("");
@@ -316,6 +366,12 @@ export default function Home() {
     return fileName || "";
   }, [dataSource, fileName]);
   const canSearch = useMemo(() => Boolean(activeBuffer) && pgsCode.trim(), [activeBuffer, pgsCode]);
+
+  const listFreeMatchingRows = useMemo(() => {
+    if (!listFree || !pgsCode.trim()) return [];
+    const input = normalizePgsCode(pgsCode);
+    return listFree.rows.filter((row) => normalizePgsCode(String(row[listFree.pgsHeaderKey] ?? "")) === input);
+  }, [listFree, pgsCode]);
 
   const copyToClipboard = async (text: string) => {
     const value = String(text ?? "").trim();
@@ -373,6 +429,26 @@ export default function Home() {
       }
     };
     void loadSubject();
+  }, []);
+
+  useEffect(() => {
+    const loadListFree = async () => {
+      try {
+        setListFreeLoading(true);
+        setListFreeError("");
+        const res = await fetch("/list-free.xlsx", { cache: "no-store" });
+        if (!res.ok) throw new Error("Khong the tai file mac dinh tu public/list-free.xlsx.");
+        const buffer = await res.arrayBuffer();
+        setListFree(parseListFree(buffer));
+      } catch (e) {
+        if (e instanceof Error && e.message) setListFreeError(e.message);
+        else setListFreeError("Co loi khi doc list-free.xlsx.");
+      } finally {
+        setListFreeLoading(false);
+      }
+    };
+
+    void loadListFree();
   }, []);
 
   const exportViolationTemplate = () => {
@@ -812,6 +888,7 @@ export default function Home() {
                 setDataSource("default");
                 setError("");
                 setReport(null);
+                setPgsCode("");
                 const input = document.getElementById("excel-input") as HTMLInputElement | null;
                 if (input) input.value = "";
               }}
@@ -1019,6 +1096,64 @@ export default function Home() {
                 </div>
               );
             })
+          )}
+        </section>
+      )}
+
+      {pgsCode.trim() && (
+        <section className="mt-6 rounded-xl border border-zinc-200 bg-white p-4 text-sm text-zinc-900">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-base font-semibold text-zinc-900">Danh sách học sinh có hội đồng nhưng chưa có phòng thi</p>
+              <p className="mt-1 text-xs text-zinc-700">Lọc theo mã phòng giám sát: {pgsCode}</p>
+            </div>
+            {listFree && (
+              <p className="text-xs text-zinc-700">
+                Kết quả: {listFreeMatchingRows.length}/{listFree.rows.length} dòng
+              </p>
+            )}
+          </div>
+
+          {listFreeLoading && <p className="mt-3 text-xs text-zinc-700">Đang tải list-free...</p>}
+          {listFreeError && <p className="mt-3 text-xs text-red-600">{listFreeError}</p>}
+
+          {!listFreeLoading && !listFreeError && listFree && (
+            <>
+              {listFreeMatchingRows.length === 0 ? (
+                <p className="mt-3 text-xs text-zinc-700">Không có dòng nào phù hợp với mã này trong list-free.xlsx.</p>
+              ) : (
+                <div className="mt-3 overflow-auto">
+                  <table className="min-w-full border-collapse text-xs">
+                    <thead>
+                      <tr>
+                        {listFree?.headers.map((header, idx) => (
+                          <th
+                            key={`list-free-h-${idx}`}
+                            className="border border-zinc-300 bg-zinc-100 px-2 py-1 text-left font-medium text-zinc-900"
+                          >
+                            {header}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {listFreeMatchingRows.map((row, rowIndex) => (
+                        <tr key={`list-free-r-${rowIndex}`}>
+                          {listFree?.headers.map((header, cellIndex) => (
+                            <td
+                              key={`list-free-r-${rowIndex}-c-${cellIndex}`}
+                              className="border border-zinc-200 px-2 py-1 align-top text-zinc-900"
+                            >
+                              {String(row[header] ?? "")}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
           )}
         </section>
       )}
