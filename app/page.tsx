@@ -879,26 +879,22 @@ export default function Home() {
           // Keep exactly 3 empty rows between main table and student block.
           for (let i = 0; i < 3; i++) rows.push([...blankRow]);
 
-          let isFirstRow = true;
           // 1) Students from list-free (original mapping)
           for (let i = 0; i < studentRows.length; i++) {
             const s = studentRows[i];
             const fullInfoText = buildStudentFullInfoText(s, listFree.headers);
-            const caThi = String(s["Ca thi"] ?? "").trim();
-            const coTrongPhongThi = String(s["Có trong phòng thi"] ?? "").trim();
             rows.push([
-              isFirstRow ? "Danh sach HS" : "",
+              fullInfoText,
               String(s["Tên hội đồng"] ?? "").trim(), // Hội đồng
               String(s["Mã hội đồng"] ?? "").trim(), // Mã hội đồng
               "", // Phòng thi
               "", // Số lượng HS đăng ký
               "", // Số lượng HS tự do
               "", // Số lượng HS thực tế
-              fullInfoText, // Hành vi vi phạm column but contains all list-free fields
-              caThi,
-              coTrongPhongThi,
+              "", // Hành vi vi phạm
+              "",
+              "",
             ]);
-            isFirstRow = false;
           }
 
           // 2) Students from list-unknow-expanded (buổi sáng/chiều mapping)
@@ -909,24 +905,21 @@ export default function Home() {
           for (let i = 0; i < studentRowsUnknown.length; i++) {
             const s = studentRowsUnknown[i];
             const fullInfoText = buildStudentFullInfoText(s, unknownHeaders);
-            const ngayThi = String(s["Ngày thi"] ?? "").trim();
             const thoiGianThi = String(s["Thời gian thi"] ?? "").trim();
             void thoiGianThi; // kept for mapping logic only (not pasted)
             // Requirement: do not paste "ca thi" and "thời gian thi" from this file into export.
-            const timeText = [ngayThi].filter(Boolean).join(" - ");
             rows.push([
-              isFirstRow ? "Danh sach HS" : "",
+              fullInfoText,
               "", // Hội đồng (không có trong list-unknow-expanded)
               "", // Mã hội đồng (không có trong list-unknow-expanded)
               "", // Phòng thi
               "", // Số lượng HS đăng ký
               "", // Số lượng HS tự do
               "", // Số lượng HS thực tế
-              fullInfoText,
-              timeText, // only ngày thi (if needed for record)
+              "",
+              "", // only ngày thi (if needed for record)
               "", // Ca thi (removed)
             ]);
-            isFirstRow = false;
           }
         }
 
