@@ -121,6 +121,74 @@ const parseDayAndSessionFromTitle = (sectionTitle: string): { day: number; sessi
   };
 };
 
+const pad2 = (n: string | number) => String(n).padStart(2, "0");
+
+/** Chuẩn hóa khung giờ (file subject vs label ca export) → ví dụ "0800-0830". */
+const normalizeScheduleTimeKey = (text: string): string | null => {
+  const s = String(text)
+    .replace(/\r\n/g, " ")
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!s) return null;
+
+  let m = s.match(/^(\d{1,2})h\s*(\d{2})\s*-\s*(\d{1,2})h\s*(\d{2})$/);
+  if (m) return `${pad2(m[1])}${m[2]}-${pad2(m[3])}${m[4]}`;
+
+  m = s.match(/^(\d{1,2})h\s*-\s*(\d{1,2})h\s*(\d{2})$/);
+  if (m) return `${pad2(m[1])}00-${pad2(m[2])}${m[3]}`;
+
+  m = s.match(/^(\d{1,2})h\s*(\d{2})\s*-\s*(\d{1,2})h(?:\s*(\d{2}))?$/);
+  if (m) {
+    const em = m[4] !== undefined ? m[4] : "00";
+    return `${pad2(m[1])}${m[2]}-${pad2(m[3])}${em}`;
+  }
+
+  return null;
+};
+
+/**
+ * Sheet "Lịch thi" trong subject.xlsx:
+ * - Ưu tiên khớp theo `Thời gian thi` + ngày → key `time|{day}|{normalizedRange}`
+ * - Fallback: `Ca thi` + ngày → key `{day}-{session}`
+ */
+const parseSubjectSchedule = (buffer: ArrayBuffer): Record<string, string> => {
+  const wb = XLSX.read(buffer, { type: "array" });
+  const ws = wb.Sheets["Lịch thi"];
+  if (!ws) return {};
+
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false }) as CellValue[][];
+  const out: Record<string, string> = {};
+  let currentDay = 1;
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i] ?? [];
+    const dayCell = String(row[0] ?? "").trim();
+    const caCell = String(row[1] ?? "").trim();
+    const timeCell = String(row[2] ?? "").trim();
+    const subjectCell = String(row[3] ?? "").trim();
+
+    if (dayCell) {
+      const dayMatch = dayCell.match(/Ngày\s*thi\s*0*(\d+)/i);
+      if (dayMatch) currentDay = Number(dayMatch[1]);
+    }
+
+    const caMatch = caCell.match(/Ca\s*thi\s*(\d+)/i);
+    if (!caMatch || !subjectCell) continue;
+    const session = Number(caMatch[1]);
+    if (!Number.isFinite(session)) continue;
+
+    const timeKey = normalizeScheduleTimeKey(timeCell);
+    if (timeKey) {
+      out[`time|${currentDay}|${timeKey}`] = subjectCell;
+    }
+    out[`${currentDay}-${session}`] = subjectCell;
+  }
+
+  return out;
+};
+
 const buildReportByPgs = (buffer: ArrayBuffer, pgsCode: string): ReportData => {
   const workbook = XLSX.read(buffer, { type: "array" });
   const pgsSheet = workbook.Sheets["Phân bổ chi tiết"];
@@ -232,6 +300,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [subjectByDaySession, setSubjectByDaySession] = useState<Record<string, string>>({});
 
   const activeBuffer = useMemo(
     () => (dataSource === "default" ? defaultBuffer : uploadBuffer),
@@ -287,6 +356,20 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const loadSubject = async () => {
+      try {
+        const res = await fetch("/subject.xlsx", { cache: "no-store" });
+        if (!res.ok) return;
+        const buffer = await res.arrayBuffer();
+        setSubjectByDaySession(parseSubjectSchedule(buffer));
+      } catch {
+        setSubjectByDaySession({});
+      }
+    };
+    void loadSubject();
+  }, []);
+
   const exportViolationTemplate = () => {
     if (!report) return;
 
@@ -328,7 +411,7 @@ export default function Home() {
     } as const;
 
     const colWidths = [
-      { wch: 22 }, // Ca thi
+      { wch: 48 }, // Ca thi + môn (xuống dòng)
       { wch: 52 }, // Hoi dong
       { wch: 10 }, // Phong thi
       { wch: 18 }, // SL dang ky
@@ -362,13 +445,20 @@ export default function Home() {
       for (const slot of VIOLATION_SESSION_SLOTS) {
         const section = sectionsByDaySession.get(`${day}-${slot.session}`);
         const sessionLabel = `Ca ${slot.session} (${slot.label})`;
+        const slotTimeKey = normalizeScheduleTimeKey(slot.label);
+        const subjectName = String(
+          (slotTimeKey ? subjectByDaySession[`time|${day}|${slotTimeKey}`] : undefined) ??
+            subjectByDaySession[`${day}-${slot.session}`] ??
+            ""
+        ).trim();
+        const sessionCellText = subjectName ? `${sessionLabel}\n${subjectName}` : sessionLabel;
         const rows: string[][] = [];
         const firstHeader = slot.reserve ? "Ca thi dự phòng" : "Ca thi";
         rows.push([firstHeader, ...headers.slice(1)]);
 
         const defaultRowCount = 6;
         if (!section) {
-          rows.push([sessionLabel, "", "", "", "", "", "", ""]);
+          rows.push([sessionCellText, "", "", "", "", "", "", ""]);
           for (let i = 1; i < defaultRowCount; i++) {
             rows.push(["", "", "", "", "", "", "", ""]);
           }
@@ -382,12 +472,12 @@ export default function Home() {
           }));
 
           if (data.length === 0) {
-            rows.push([sessionLabel, "", "", "", "", "", "", ""]);
+            rows.push([sessionCellText, "", "", "", "", "", "", ""]);
           } else {
             for (let i = 0; i < data.length; i++) {
               const item = data[i];
               rows.push([
-                i === 0 ? sessionLabel : "",
+                i === 0 ? sessionCellText : "",
                 item.council,
                 item.room,
                 item.registered,
@@ -404,6 +494,9 @@ export default function Home() {
           }
         }
 
+        const councilCodesLine = getSectionCouncilCodes(section?.rows ?? []) || "";
+        rows.push([councilCodesLine, "", "", "", "", "", "", ""]);
+
         const ws = XLSXStyle.utils.aoa_to_sheet(rows) as XLSXStyle.WorkSheet & {
           "!cols"?: { wch?: number }[];
           "!merges"?: { s: { r: number; c: number }; e: { r: number; c: number } }[];
@@ -413,16 +506,16 @@ export default function Home() {
         ws["!cols"] = colWidths;
         ws["!freeze"] = { ySplit: 1 };
 
-        // Merge "Ca thi" column vertically like the template image (if there is data)
-        if (rows.length > 1) {
+        // Merge "Ca thi" column for data rows only (footer row lists mã HĐT separately)
+        const footerRowIndex = rows.length - 1;
+        const lastDataRowIndex = footerRowIndex - 1;
+        if (lastDataRowIndex >= 1) {
           ws["!merges"] = [
-            {
-              s: { r: 1, c: 0 },
-              e: { r: rows.length - 1, c: 0 },
-            },
+            { s: { r: 1, c: 0 }, e: { r: lastDataRowIndex, c: 0 } },
+            { s: { r: footerRowIndex, c: 0 }, e: { r: footerRowIndex, c: 7 } },
           ];
           const addr = XLSXStyle.utils.encode_cell({ r: 1, c: 0 });
-          ws[addr] = { t: "s", v: sessionLabel, s: styleSessionCell } as unknown as XLSXStyle.CellObject;
+          ws[addr] = { t: "s", v: sessionCellText, s: styleSessionCell } as unknown as XLSXStyle.CellObject;
         }
 
         const range = XLSXStyle.utils.decode_range(ws["!ref"] ?? "A1:H1");
@@ -628,9 +721,6 @@ export default function Home() {
   };
 
   const handleSearch = (event: ChangeEvent<HTMLInputElement>) => {
-    if (!event.target.value) {
-      return;
-    }
     const value = event.target.value.trim();
     setPgsCode(value);
     setError("");
